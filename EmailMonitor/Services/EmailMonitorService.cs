@@ -1,7 +1,14 @@
-﻿using MailKit;
+﻿using EmailMonitor.Model;
+using MailKit;
 using MailKit.Net.Imap;
 using MailKit.Search;
 using MailKit.Security;
+using Microsoft.Extensions.Configuration;
+using Newtonsoft.Json;
+using System;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
 using System.Threading;
 
 namespace EmailMonitor.Services
@@ -11,29 +18,28 @@ namespace EmailMonitor.Services
         private readonly IConfiguration _configuration;
         private readonly ILogger<EmailMonitorService> _logger;
         private readonly ImapClient _client;
-        private CancellationTokenSource _cancellationTokenSource;
-        //private SemaphoreSlim _semaphore;
+        private readonly string _server;
+        private readonly int _port;
+        private readonly string _username;
+        private readonly string _password;
 
         public EmailMonitorService(IConfiguration configuration, ILogger<EmailMonitorService> logger)
         {
             _configuration = configuration;
             _logger = logger;
             _client = new ImapClient();
-            // _semaphore = new SemaphoreSlim(1, 1); // Initialize semaphore with 1 available slot
+            _server = _configuration.GetSection("EmailSettings")["Server"];
+            _port = int.Parse(_configuration.GetSection("EmailSettings")["Server"]);
+            _username = _configuration.GetSection("EmailSettings")["Username"];
+            _password = _configuration.GetSection("EmailSettings")["Password"];
         }
 
         public async Task StartMonitoringAsync(CancellationToken cancellationToken)
         {
             try
             {
-                var emailSettings = _configuration.GetSection("EmailSettings");
-                var server = emailSettings["Server"];
-                var port = int.Parse(emailSettings["Port"]);
-                var username = emailSettings["Username"];
-                var password = emailSettings["Password"];
-
-                await _client.ConnectAsync(server, port, SecureSocketOptions.SslOnConnect, cancellationToken);
-                await _client.AuthenticateAsync(username, password, cancellationToken);
+                await _client.ConnectAsync(_server, _port, SecureSocketOptions.SslOnConnect, cancellationToken);
+                await _client.AuthenticateAsync(_username, _password, cancellationToken);
 
                 await _client.Inbox.OpenAsync(FolderAccess.ReadOnly);
                 _client.Inbox.CountChanged += OnMessagesArrived;
@@ -51,18 +57,62 @@ namespace EmailMonitor.Services
         {
             try
             {
-                var folder = await _client.GetFolderAsync("Inbox");
-                await folder.OpenAsync(FolderAccess.ReadOnly);
+                var email = await EmailServiceAsync();
 
-                var message = folder.LastOrDefault();
-
-
-                _logger.LogInformation($"New email received: {message.Subject}");
+                await CallWebHookAsync(email);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "An error occurred while processing the received email.");
             }
+        }
+
+        private static async Task CallWebHookAsync(EmailModel email)
+        {
+            var handler = new HttpClientHandler();
+            //for SSL
+            handler.ServerCertificateCustomValidationCallback = (HttpRequestMessage request, X509Certificate2 certificate, X509Chain chain, SslPolicyErrors sslErrors) => true;
+
+            var client = new HttpClient(handler);
+            var json = JsonConvert.SerializeObject(email);
+            var content = new StringContent(json, Encoding.UTF8, "application/json");
+            var response = await client.PostAsync("https://localhost:7252/api/email-services", content);
+            if (response.IsSuccessStatusCode)
+            {
+                var responseBody = await response.Content.ReadAsStringAsync();
+                Console.WriteLine(responseBody);
+            }
+            else
+            {
+                Console.WriteLine($"Error: {response.StatusCode}");
+            }
+        }
+
+        public async Task<EmailModel> EmailServiceAsync()
+        {
+            var email = new EmailModel();
+
+            using (var imapClient = new ImapClient())
+            {
+                var cancellationToken = new CancellationTokenSource().Token;
+                await imapClient.ConnectAsync(_server, _port, SecureSocketOptions.SslOnConnect, cancellationToken);
+                await imapClient.AuthenticateAsync(_username, _password, cancellationToken);
+
+                var mailFolder = await imapClient.GetFolderAsync("INBOX", cancellationToken);
+                await mailFolder.OpenAsync(FolderAccess.ReadOnly, cancellationToken);
+                var newEmail = await mailFolder.SearchAsync(SearchQuery.NotSeen);
+                Console.WriteLine($"Count new arrived{newEmail.Count}");
+                email.MessageId = newEmail.LastOrDefault();
+
+                var mimeMessage = await mailFolder.GetMessageAsync(email.MessageId, cancellationToken);
+                email.EmailBody = mimeMessage.HtmlBody;
+                email.Subject = mimeMessage.Subject;
+
+                await mailFolder.CloseAsync(false);
+                await imapClient.DisconnectAsync(true);
+            }
+
+            return email;
         }
     }
 }
